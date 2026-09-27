@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Геогессер по Москве</title>
+<link rel="stylesheet" href="style.css" />
+<!-- ВСТАВЬТЕ СВОЙ КЛЮЧ ЯНДЕКС.КАРТ ВМЕСТО YOUR_API_KEY_HERE -->
+<script src="https://api-maps.yandex.ru/2.1/?apikey=2bfa0fca-efa6-44c2-bc55-8d8fdbf18f16&lang=ru_RU"></script>
+<script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+
+<div id="screen-lobby" class="screen">
+  <div class="card">
+    <h1>🗺️ Геогессер по Москве</h1>
+    <p class="subtitle">Игра на двоих: угадывайте место по панораме Яндекс.Карт</p>
+
+    <label>Ваше имя</label>
+    <input id="name-input" type="text" placeholder="Введите имя" maxlength="20" />
+
+    <div class="lobby-actions">
+      <button id="create-btn" class="primary">Создать комнату</button>
+      <div class="or">или</div>
+      <input id="join-code-input" type="text" placeholder="Код комнаты" maxlength="4" style="text-transform:uppercase" />
+      <button id="join-btn">Присоединиться</button>
+    </div>
+
+    <p id="lobby-error" class="error"></p>
+  </div>
+</div>
+
+<div id="screen-waiting" class="screen hidden">
+  <div class="card">
+    <h2>Комната создана</h2>
+    <p>Код комнаты:</p>
+    <div id="room-code-display" class="room-code"></div>
+    <p>Отправьте этот код другу — он введёт его на экране входа.</p>
+    <p id="waiting-status">Ожидаем второго игрока…</p>
+    <button id="start-btn" class="primary hidden">Начать игру</button>
+  </div>
+</div>
+
+<div id="screen-game" class="screen hidden">
+  <div class="game-header">
+    <div id="round-indicator">Раунд 1 / 5</div>
+    <div id="scoreboard"></div>
+  </div>
+  <div id="pano" class="pano"></div>
+  <div id="guess-panel">
+    <div id="guess-map" class="guess-map"></div>
+    <button id="submit-guess-btn" class="primary" disabled>Отправить догадку</button>
+    <p id="guess-status" class="guess-status"></p>
+  </div>
+</div>
+
+<div id="screen-result" class="screen hidden">
+  <div class="card">
+    <h2 id="result-title">Результаты раунда</h2>
+    <div id="result-map" class="result-map"></div>
+    <div id="result-list"></div>
+    <p id="next-round-note"></p>
+  </div>
+</div>
+
+<div id="screen-gameover" class="screen hidden">
+  <div class="card">
+    <h2>🏁 Игра окончена</h2>
+    <div id="final-scores"></div>
+    <button id="play-again-btn" class="primary">Играть снова</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
