@@ -93,22 +93,31 @@ socket.on('round-start', (data) => {
 });
 
 function loadPanorama(lat, lon) {
+  const panoEl = document.getElementById('pano');
   ymaps.ready(() => {
     if (panoPlayer) {
       panoPlayer.destroy();
       panoPlayer = null;
     }
-    document.getElementById('pano').innerHTML = '';
-    ymaps.panorama.locate([lat, lon]).then((panoramas) => {
-      if (panoramas.length > 0) {
-        panoPlayer = new ymaps.panorama.Player('pano', panoramas[0], {
-          controls: ['zoomControl'],
-        });
-      } else {
-        document.getElementById('pano').innerHTML =
-          '<p style="color:white;padding:20px">Панорама для этой точки не найдена. Пропускаем раунд для честности — сообщите об этом в чате.</p>';
-      }
-    });
+    panoEl.innerHTML = '<p style="color:white;padding:20px">Загружаем панораму…</p>';
+    ymaps.panorama
+      .locate([lat, lon])
+      .then((panoramas) => {
+        if (panoramas.length > 0) {
+          panoEl.innerHTML = '';
+          panoPlayer = new ymaps.panorama.Player('pano', panoramas[0], {
+            controls: ['zoomControl'],
+          });
+        } else {
+          panoEl.innerHTML =
+            '<p style="color:white;padding:20px">Панорама для этой точки не найдена (нет покрытия рядом). Сообщите об этом — точку можно заменить в списке локаций.</p>';
+        }
+      })
+      .catch((err) => {
+        console.error('panorama.locate error:', err);
+        panoEl.innerHTML =
+          '<p style="color:white;padding:20px">Не удалось загрузить панораму (ошибка API). Откройте консоль браузера (F12) и посмотрите на текст ошибки.</p>';
+      });
   });
 }
 
