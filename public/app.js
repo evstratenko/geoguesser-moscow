@@ -8,6 +8,7 @@ let guessMap = null;
 let guessPlacemark = null;
 let currentGuess = null;
 let latestRoundSpot = null;
+let countdownInterval = null;
 
 const screens = {
   lobby: document.getElementById('screen-lobby'),
@@ -79,18 +80,91 @@ socket.on('player-left', () => {
   location.reload();
 });
 
+// ---------- Поиск случайной точки (делает хост) ----------
+
+const MOSCOW_CENTER = [55.7522, 37.6156];
+const MAX_PANO_DISTANCE_M = 300; // панорама должна быть не дальше от случайной точки
+
+function randomMoscowPoint() {
+  // равномерно внутри эллипса примерно по границе МКАД
+  for (;;) {
+    const a = Math.random() * 2 - 1;
+    const b = Math.random() * 2 - 1;
+    if (a * a + b * b <= 1) return [MOSCOW_CENTER[0] + a * 0.15, MOSCOW_CENTER[1] + b * 0.26];
+  }
+}
+
+function distMeters(a, b) {
+  const R = 6371000;
+  const rad = (d) => (d * Math.PI) / 180;
+  const dLat = rad(b[0] - a[0]);
+  const dLon = rad(b[1] - a[1]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a[0])) * Math.cos(rad(b[0])) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+async function findRandomSpot(maxAttempts = 25) {
+  await new Promise((resolve) => ymaps.ready(resolve));
+  for (let i = 0; i < maxAttempts; i++) {
+    const pt = randomMoscowPoint();
+    try {
+      const panoramas = await ymaps.panorama.locate(pt);
+      if (panoramas.length > 0) {
+        const pos = panoramas[0].getPosition();
+        if (distMeters(pt, pos) <= MAX_PANO_DISTANCE_M) return { lat: pos[0], lon: pos[1] };
+      }
+    } catch (err) {
+      console.warn('locate failed, retrying', err);
+    }
+  }
+  return null;
+}
+
+socket.on('find-spot', async () => {
+  document.getElementById('next-round-note').textContent = 'Ищем случайную точку…';
+  const spot = await findRandomSpot();
+  if (spot) socket.emit('spot-found', spot);
+  else socket.emit('spot-failed');
+});
+
 // ---------- Game ----------
 
 socket.on('round-start', (data) => {
   latestRoundSpot = data;
   currentGuess = null;
+  stopCountdown();
   document.getElementById('round-indicator').textContent = `Раунд ${data.round} / ${data.totalRounds}`;
   document.getElementById('guess-status').textContent = '';
   document.getElementById('submit-guess-btn').disabled = true;
+  if (data.players) renderScoreboard(data.players);
   showScreen('game');
   loadPanorama(data.lat, data.lon);
   setupGuessMap();
 });
+
+function renderScoreboard(players) {
+  const el = document.getElementById('scoreboard');
+  el.innerHTML = players.map((p) => `<span>${p.name}: ${p.score}</span>`).join('');
+}
+
+function stopCountdown() {
+  if (countdownInterval) {
+    clearInterval(countdownInterval);
+    countdownInterval = null;
+  }
+}
+
+function startCountdown(deadline, waitingFor) {
+  stopCountdown();
+  const statusEl = document.getElementById('guess-status');
+  const tick = () => {
+    const secondsLeft = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+    statusEl.textContent = `Ждём: ${waitingFor.join(', ')} — осталось ${secondsLeft} сек`;
+    if (secondsLeft <= 0) stopCountdown();
+  };
+  tick();
+  countdownInterval = setInterval(tick, 1000);
+}
 
 function loadPanorama(lat, lon) {
   const panoEl = document.getElementById('pano');
@@ -160,7 +234,9 @@ document.getElementById('submit-guess-btn').addEventListener('click', () => {
 });
 
 socket.on('guess-received', (data) => {
-  if (data.waitingFor.length > 0) {
+  if (data.waitingFor.length > 0 && data.deadline) {
+    startCountdown(data.deadline, data.waitingFor);
+  } else if (data.waitingFor.length > 0) {
     document.getElementById('guess-status').textContent = `Ждём: ${data.waitingFor.join(', ')}`;
   }
 });
@@ -168,6 +244,7 @@ socket.on('guess-received', (data) => {
 // ---------- Round result ----------
 
 socket.on('round-result', (data) => {
+  stopCountdown();
   showScreen('result');
   document.getElementById('result-title').textContent =
     `Раунд ${data.round} / ${data.totalRounds} — ${data.actual.name}`;
@@ -219,12 +296,26 @@ socket.on('round-result', (data) => {
       map.geoObjects.add(line);
     });
     map.setBounds(map.geoObjects.getBounds(), { checkZoomRange: true, zoomMargin: 40 });
+
+    if (data.actual.name === 'Случайная точка') {
+      ymaps
+        .geocode([data.actual.lat, data.actual.lon], { results: 1 })
+        .then((res) => {
+          const first = res.geoObjects.get(0);
+          if (first) {
+            document.getElementById('result-title').textContent =
+              `Раунд ${data.round} / ${data.totalRounds} — ${first.getAddressLine()}`;
+          }
+        })
+        .catch(() => {});
+    }
   });
 });
 
 // ---------- Game over ----------
 
 socket.on('game-over', (data) => {
+  stopCountdown();
   showScreen('gameover');
   const el = document.getElementById('final-scores');
   el.innerHTML = '';
