@@ -58,7 +58,25 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   box-shadow: 0 8px 24px rgba(0,0,0,0.5);
   width: 300px;
 }
-.guess-map { width: 100%; height: 220px; border-radius: 8px; overflow: hidden; }
+.guess-map {
+  width: 100%; height: 220px; border-radius: 8px; overflow: hidden;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  transform-origin: center;
+  cursor: crosshair;
+}
+.guess-map:hover {
+  transform: scale(1.06);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+}
+
+/* Яндекс.Панорамы не дают официальной опции скрыть маркеры домов/организаций,
+   поэтому глушим их через CSS по подстроке класса. Если какие-то флажки всё
+   ещё видны — можно уточнить точный класс через "Инспектировать элемент". */
+.pano [class*="panorama"][class*="marker"],
+.pano [class*="panorama"][class*="placemark"],
+.pano [class*="panorama"][class*="pin"] {
+  display: none !important;
+}
 .guess-status { font-size: 0.8rem; color: #9aa9bd; text-align: center; margin-top: 6px; min-height: 16px; }
 
 .result-map { width: 100%; height: 260px; border-radius: 10px; overflow: hidden; margin: 16px 0; }
