@@ -11,9 +11,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 const ROUNDS_PER_GAME = 5;
-const ROUND_TIMEOUT_MS = 90 * 1000; // если оба игрока молчат — раунд всё равно завершится
+const ROUND_TIMEOUT_MS = 180 * 1000; // общий таймер раунда — 3 минуты
 const FIND_SPOT_TIMEOUT_MS = 20 * 1000; // сколько ждём случайную точку от хоста, потом берём запасную из списка
-const AFTER_FIRST_GUESS_TIMEOUT_MS = 25 * 1000; // сколько ждём второго игрока после первой догадки
+const AFTER_FIRST_GUESS_TIMEOUT_MS = 20 * 1000; // сколько ждём второго игрока после первой догадки
 const SCORE_DECAY_METERS = 4000; // насколько быстро падают очки с расстоянием
 
 // Точки в Москве — центр и известные места вперемешку с обычными районами,
@@ -169,12 +169,14 @@ function beginRound(code, spot) {
   clearRoomTimer(room);
   room.pendingSpot = false;
   room.currentSpot = spot;
+  const deadline = Date.now() + ROUND_TIMEOUT_MS;
   io.to(code).emit('round-start', {
     round: room.round + 1,
     totalRounds: ROUNDS_PER_GAME,
     lat: spot.lat,
     lon: spot.lon,
     players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score })),
+    deadline,
   });
   room.timer = setTimeout(() => finishRound(code), ROUND_TIMEOUT_MS);
 }
@@ -214,7 +216,7 @@ function finishRound(code) {
       io.to(code).emit('game-over', { players: room.players.map((p) => ({ name: p.name, score: p.score })) });
     }, 300);
   } else {
-    setTimeout(() => startRound(code), 4000); // пауза, чтобы посмотреть результат раунда
+    room.awaitingNext = true; // ждём, когда хост нажмёт "следующий раунд"
   }
 }
 
@@ -290,6 +292,15 @@ io.on('connection', (socket) => {
       io.to(code).emit('guess-received', { playerId: socket.id, waitingFor });
       finishRound(code);
     }
+  });
+
+  socket.on('next-round', () => {
+    const code = socket.data.roomCode;
+    const room = rooms.get(code);
+    if (!room || !room.awaitingNext || room.gameOver) return;
+    if (room.players[0].id !== socket.id) return; // только хост может продолжить
+    room.awaitingNext = false;
+    startRound(code);
   });
 
   socket.on('disconnect', () => {
