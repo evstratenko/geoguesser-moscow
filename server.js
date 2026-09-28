@@ -11,11 +11,14 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 const ROUNDS_PER_GAME = 5;
-const ROUND_TIMEOUT_MS = 90 * 1000; // если игрок завис — раунд всё равно завершится
+const ROUND_TIMEOUT_MS = 90 * 1000; // если оба игрока молчат — раунд всё равно завершится
+const FIND_SPOT_TIMEOUT_MS = 20 * 1000; // сколько ждём случайную точку от хоста, потом берём запасную из списка
+const AFTER_FIRST_GUESS_TIMEOUT_MS = 25 * 1000; // сколько ждём второго игрока после первой догадки
 const SCORE_DECAY_METERS = 4000; // насколько быстро падают очки с расстоянием
 
-// Точки в Москве с хорошим покрытием Яндекс.Панорам (центр, известные локации).
-// Если точной панорамы нет — клиент сам подтянет ближайшую через ymaps.panorama.locate().
+// Точки в Москве — центр и известные места вперемешку с обычными районами,
+// чтобы раунды не были только "туристическими". Если точной панорамы нет —
+// клиент сам подтянет ближайшую через ymaps.panorama.locate().
 const MOSCOW_SPOTS = [
   { lat: 55.7539, lon: 37.6208, name: 'Красная площадь' },
   { lat: 55.7601, lon: 37.6186, name: 'Тверская улица' },
@@ -47,7 +50,44 @@ const MOSCOW_SPOTS = [
   { lat: 55.7501, lon: 37.6284, name: 'Парк Зарядье' },
   { lat: 55.7089, lon: 37.6156, name: 'Даниловский район' },
   { lat: 55.8058, lon: 37.4913, name: 'Химки-Ховрино' },
+  // Обычные жилые районы и окраины — для разнообразия
+  { lat: 55.7887, lon: 37.4460, name: 'Строгино' },
+  { lat: 55.7562, lon: 37.4292, name: 'Крылатское' },
+  { lat: 55.7285, lon: 37.4267, name: 'Кунцево' },
+  { lat: 55.6516, lon: 37.5136, name: 'Ясенево' },
+  { lat: 55.6205, lon: 37.5697, name: 'Чертаново Южное' },
+  { lat: 55.6764, lon: 37.7466, name: 'Люблино' },
+  { lat: 55.6558, lon: 37.7413, name: 'Марьино' },
+  { lat: 55.6944, lon: 37.7830, name: 'Кузьминки' },
+  { lat: 55.7448, lon: 37.7997, name: 'Перово' },
+  { lat: 55.7526, lon: 37.8267, name: 'Новогиреево' },
+  { lat: 55.8103, lon: 37.7708, name: 'Ивановское' },
+  { lat: 55.8288, lon: 37.7825, name: 'Гольяново' },
+  { lat: 55.8241, lon: 37.7085, name: 'Богородское' },
+  { lat: 55.8626, lon: 37.6237, name: 'Медведково' },
+  { lat: 55.8664, lon: 37.5844, name: 'Отрадное' },
+  { lat: 55.8489, lon: 37.5298, name: 'Ховрино' },
+  { lat: 55.8236, lon: 37.4756, name: 'Северное Тушино' },
+  { lat: 55.7818, lon: 37.4771, name: 'Щукино' },
+  { lat: 55.7562, lon: 37.4886, name: 'Мнёвники' },
+  { lat: 55.7010, lon: 37.4826, name: 'Раменки' },
+  { lat: 55.6644, lon: 37.4990, name: 'Тёплый Стан' },
+  { lat: 55.6698, lon: 37.5311, name: 'Коньково' },
+  { lat: 55.7089, lon: 37.6767, name: 'Печатники' },
+  { lat: 55.7071, lon: 37.7395, name: 'Выхино' },
+  { lat: 55.6934, lon: 37.8267, name: 'Жулебино' },
+  { lat: 55.6688, lon: 37.8697, name: 'Некрасовка' },
+  { lat: 55.7521, lon: 37.8578, name: 'Новокосино' },
+  { lat: 55.5993, lon: 37.6720, name: 'Бирюлёво' },
+  { lat: 55.6407, lon: 37.6373, name: 'Нагатинский затон' },
+  { lat: 55.7766, lon: 37.6960, name: 'Преображенская площадь' },
+  { lat: 55.7280, lon: 37.6693, name: 'Волгоградский проспект' },
 ];
+
+// Сколько последних локаций держим "в резерве", чтобы они не выпадали
+// в следующих играх — пока пул не обновится.
+const RECENTLY_USED_LIMIT = Math.max(MOSCOW_SPOTS.length - ROUNDS_PER_GAME * 2, ROUNDS_PER_GAME);
+let recentlyUsed = []; // FIFO очередь имён (name) недавно сыгранных точек
 
 /** rooms: code -> { players: [{id,name,score}], round, order, used, guesses, timer, started, gameOver } */
 const rooms = new Map();
@@ -62,8 +102,19 @@ function makeRoomCode() {
 }
 
 function pickRoundOrder() {
-  const shuffled = [...MOSCOW_SPOTS].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, ROUNDS_PER_GAME);
+  const usedSet = new Set(recentlyUsed);
+  const fresh = MOSCOW_SPOTS.filter((s) => !usedSet.has(s.name));
+  // Если "свежих" точек не хватает на игру — добираем из полного списка,
+  // чтобы игра не зависела от истории (пул всё равно достаточно большой).
+  const pool = fresh.length >= ROUNDS_PER_GAME ? fresh : MOSCOW_SPOTS;
+  const shuffled = [...pool].sort(() => Math.random() - 0.5);
+  const chosen = shuffled.slice(0, ROUNDS_PER_GAME);
+
+  recentlyUsed.push(...chosen.map((s) => s.name));
+  if (recentlyUsed.length > RECENTLY_USED_LIMIT) {
+    recentlyUsed = recentlyUsed.slice(recentlyUsed.length - RECENTLY_USED_LIMIT);
+  }
+  return chosen;
 }
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
@@ -103,12 +154,27 @@ function startRound(code) {
   if (!room) return;
   clearRoomTimer(room);
   room.guesses = {};
-  const spot = room.order[room.round];
+  room.currentSpot = null;
+  room.pendingSpot = true;
+  // Хост ищет в своём браузере случайную точку, где точно есть панорама.
+  io.to(room.players[0].id).emit('find-spot', { round: room.round + 1 });
+  room.timer = setTimeout(() => {
+    if (room.pendingSpot) beginRound(code, room.order[room.round]); // запасная точка из списка
+  }, FIND_SPOT_TIMEOUT_MS);
+}
+
+function beginRound(code, spot) {
+  const room = rooms.get(code);
+  if (!room) return;
+  clearRoomTimer(room);
+  room.pendingSpot = false;
+  room.currentSpot = spot;
   io.to(code).emit('round-start', {
     round: room.round + 1,
     totalRounds: ROUNDS_PER_GAME,
     lat: spot.lat,
     lon: spot.lon,
+    players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score })),
   });
   room.timer = setTimeout(() => finishRound(code), ROUND_TIMEOUT_MS);
 }
@@ -117,7 +183,7 @@ function finishRound(code) {
   const room = rooms.get(code);
   if (!room) return;
   clearRoomTimer(room);
-  const spot = room.order[room.round];
+  const spot = room.currentSpot || room.order[room.round];
   const results = room.players.map((p) => {
     const g = room.guesses[p.id];
     const distance = g ? haversineMeters(spot.lat, spot.lon, g.lat, g.lon) : null;
@@ -190,16 +256,38 @@ io.on('connection', (socket) => {
     startRound(code);
   });
 
+  socket.on('spot-found', ({ lat, lon }) => {
+    const code = socket.data.roomCode;
+    const room = rooms.get(code);
+    if (!room || !room.pendingSpot || room.players[0].id !== socket.id) return;
+    const ok =
+      typeof lat === 'number' && typeof lon === 'number' &&
+      lat > 55.4 && lat < 56.0 && lon > 37.2 && lon < 38.0;
+    beginRound(code, ok ? { lat, lon, name: 'Случайная точка' } : room.order[room.round]);
+  });
+
+  socket.on('spot-failed', () => {
+    const code = socket.data.roomCode;
+    const room = rooms.get(code);
+    if (!room || !room.pendingSpot || room.players[0].id !== socket.id) return;
+    beginRound(code, room.order[room.round]);
+  });
+
   socket.on('submit-guess', ({ lat, lon }) => {
     const code = socket.data.roomCode;
     const room = rooms.get(code);
     if (!room || room.gameOver) return;
     room.guesses[socket.id] = { lat, lon };
-    io.to(code).emit('guess-received', {
-      playerId: socket.id,
-      waitingFor: room.players.filter((p) => !room.guesses[p.id]).map((p) => p.name),
-    });
-    if (room.players.every((p) => room.guesses[p.id])) {
+    const waitingFor = room.players.filter((p) => !room.guesses[p.id]).map((p) => p.name);
+
+    if (waitingFor.length > 0) {
+      // Кто-то уже отгадал — даём второму ограниченное время, чтобы не ждать вечно.
+      clearRoomTimer(room);
+      const deadline = Date.now() + AFTER_FIRST_GUESS_TIMEOUT_MS;
+      room.timer = setTimeout(() => finishRound(code), AFTER_FIRST_GUESS_TIMEOUT_MS);
+      io.to(code).emit('guess-received', { playerId: socket.id, waitingFor, deadline });
+    } else {
+      io.to(code).emit('guess-received', { playerId: socket.id, waitingFor });
       finishRound(code);
     }
   });
