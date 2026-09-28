@@ -8,7 +8,8 @@ let guessMap = null;
 let guessPlacemark = null;
 let currentGuess = null;
 let latestRoundSpot = null;
-let countdownInterval = null;
+let guessCountdownInterval = null;
+let roundCountdownInterval = null;
 
 const screens = {
   lobby: document.getElementById('screen-lobby'),
@@ -132,11 +133,12 @@ socket.on('find-spot', async () => {
 socket.on('round-start', (data) => {
   latestRoundSpot = data;
   currentGuess = null;
-  stopCountdown();
+  stopGuessCountdown();
   document.getElementById('round-indicator').textContent = `Раунд ${data.round} / ${data.totalRounds}`;
   document.getElementById('guess-status').textContent = '';
   document.getElementById('submit-guess-btn').disabled = true;
   if (data.players) renderScoreboard(data.players);
+  if (data.deadline) startRoundCountdown(data.deadline);
   showScreen('game');
   loadPanorama(data.lat, data.lon);
   setupGuessMap();
@@ -147,23 +149,54 @@ function renderScoreboard(players) {
   el.innerHTML = players.map((p) => `<span>${p.name}: ${p.score}</span>`).join('');
 }
 
-function stopCountdown() {
-  if (countdownInterval) {
-    clearInterval(countdownInterval);
-    countdownInterval = null;
+function formatMMSS(totalSeconds) {
+  const s = Math.max(0, totalSeconds);
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function stopRoundCountdown() {
+  if (roundCountdownInterval) {
+    clearInterval(roundCountdownInterval);
+    roundCountdownInterval = null;
+  }
+  document.getElementById('round-timer').textContent = '';
+}
+
+function startRoundCountdown(deadline) {
+  stopRoundCountdown();
+  const el = document.getElementById('round-timer');
+  const tick = () => {
+    const secondsLeft = Math.round((deadline - Date.now()) / 1000);
+    if (secondsLeft <= 0) {
+      el.textContent = '⏱ 0:00';
+      stopRoundCountdown();
+      return;
+    }
+    el.textContent = `⏱ ${formatMMSS(secondsLeft)}`;
+  };
+  tick();
+  roundCountdownInterval = setInterval(tick, 1000);
+}
+
+function stopGuessCountdown() {
+  if (guessCountdownInterval) {
+    clearInterval(guessCountdownInterval);
+    guessCountdownInterval = null;
   }
 }
 
-function startCountdown(deadline, waitingFor) {
-  stopCountdown();
+function startGuessCountdown(deadline, waitingFor) {
+  stopGuessCountdown();
   const statusEl = document.getElementById('guess-status');
   const tick = () => {
     const secondsLeft = Math.max(0, Math.round((deadline - Date.now()) / 1000));
     statusEl.textContent = `Ждём: ${waitingFor.join(', ')} — осталось ${secondsLeft} сек`;
-    if (secondsLeft <= 0) stopCountdown();
+    if (secondsLeft <= 0) stopGuessCountdown();
   };
   tick();
-  countdownInterval = setInterval(tick, 1000);
+  guessCountdownInterval = setInterval(tick, 1000);
 }
 
 function loadPanorama(lat, lon) {
@@ -235,7 +268,7 @@ document.getElementById('submit-guess-btn').addEventListener('click', () => {
 
 socket.on('guess-received', (data) => {
   if (data.waitingFor.length > 0 && data.deadline) {
-    startCountdown(data.deadline, data.waitingFor);
+    startGuessCountdown(data.deadline, data.waitingFor);
   } else if (data.waitingFor.length > 0) {
     document.getElementById('guess-status').textContent = `Ждём: ${data.waitingFor.join(', ')}`;
   }
@@ -244,7 +277,8 @@ socket.on('guess-received', (data) => {
 // ---------- Round result ----------
 
 socket.on('round-result', (data) => {
-  stopCountdown();
+  stopGuessCountdown();
+  stopRoundCountdown();
   showScreen('result');
   document.getElementById('result-title').textContent =
     `Раунд ${data.round} / ${data.totalRounds} — ${data.actual.name}`;
@@ -262,9 +296,18 @@ socket.on('round-result', (data) => {
     });
 
   const isLast = data.round >= data.totalRounds;
-  document.getElementById('next-round-note').textContent = isLast
-    ? 'Это был последний раунд — сейчас покажем итог.'
-    : 'Следующий раунд начнётся через несколько секунд…';
+  const nextBtn = document.getElementById('next-round-btn');
+  if (isLast) {
+    document.getElementById('next-round-note').textContent = 'Это был последний раунд — сейчас покажем итог.';
+    nextBtn.classList.add('hidden');
+  } else if (isHost) {
+    document.getElementById('next-round-note').textContent = 'Когда оба посмотрели на карту — жмите «Следующий раунд».';
+    nextBtn.classList.remove('hidden');
+    nextBtn.disabled = false;
+  } else {
+    document.getElementById('next-round-note').textContent = 'Ждём, когда хост начнёт следующий раунд…';
+    nextBtn.classList.add('hidden');
+  }
 
   ymaps.ready(() => {
     const el = document.getElementById('result-map');
@@ -312,10 +355,17 @@ socket.on('round-result', (data) => {
   });
 });
 
+document.getElementById('next-round-btn').addEventListener('click', (e) => {
+  socket.emit('next-round');
+  e.target.disabled = true;
+  document.getElementById('next-round-note').textContent = 'Запускаем следующий раунд…';
+});
+
 // ---------- Game over ----------
 
 socket.on('game-over', (data) => {
-  stopCountdown();
+  stopGuessCountdown();
+  stopRoundCountdown();
   showScreen('gameover');
   const el = document.getElementById('final-scores');
   el.innerHTML = '';
