@@ -10,6 +10,32 @@ let currentGuess = null;
 let latestRoundSpot = null;
 let guessCountdownInterval = null;
 let roundCountdownInterval = null;
+let myPlayerId = null;
+
+// Цвета меток на итоговой карте — по одному на игрока (зелёный зарезервирован
+// под настоящее место, поэтому в палитре его нет).
+const PLAYER_COLORS = [
+  { preset: 'islands#blueDotIcon', hex: '#3d7bfd' },
+  { preset: 'islands#violetDotIcon', hex: '#9b59d0' },
+  { preset: 'islands#orangeDotIcon', hex: '#ff9f43' },
+  { preset: 'islands#yellowDotIcon', hex: '#ffd166' },
+];
+let playerColorIndex = {}; // playerId -> индекс в PLAYER_COLORS
+
+function assignColors(players) {
+  playerColorIndex = {};
+  players.forEach((p, i) => {
+    playerColorIndex[p.id] = i % PLAYER_COLORS.length;
+  });
+}
+
+function colorFor(playerId) {
+  return PLAYER_COLORS[playerColorIndex[playerId] ?? 0];
+}
+
+socket.on('connect', () => {
+  myPlayerId = socket.id;
+});
 
 const screens = {
   lobby: document.getElementById('screen-lobby'),
@@ -31,7 +57,6 @@ document.getElementById('create-btn').addEventListener('click', () => {
   socket.emit('create-room', { name: myName }, (res) => {
     if (!res.ok) return showLobbyError('Не удалось создать комнату');
     myRoomCode = res.code;
-    isHost = true;
     document.getElementById('room-code-display').textContent = myRoomCode;
     showScreen('waiting');
     renderWaiting(res.state);
@@ -39,13 +64,12 @@ document.getElementById('create-btn').addEventListener('click', () => {
 });
 
 document.getElementById('join-btn').addEventListener('click', () => {
-  myName = document.getElementById('name-input').value.trim() || 'Игрок 2';
+  myName = document.getElementById('name-input').value.trim() || 'Игрок';
   const code = document.getElementById('join-code-input').value.trim().toUpperCase();
   if (code.length !== 4) return showLobbyError('Код комнаты — 4 символа');
   socket.emit('join-room', { code, name: myName }, (res) => {
     if (!res.ok) return showLobbyError(res.error);
     myRoomCode = res.code;
-    isHost = false;
     document.getElementById('room-code-display').textContent = myRoomCode;
     showScreen('waiting');
     renderWaiting(res.state);
@@ -57,13 +81,24 @@ function showLobbyError(msg) {
 }
 
 function renderWaiting(state) {
+  isHost = state.hostId === socket.id;
   const statusEl = document.getElementById('waiting-status');
   const startBtn = document.getElementById('start-btn');
-  if (state.players.length >= 2) {
-    statusEl.textContent = `Оба игрока на месте: ${state.players.map((p) => p.name).join(' и ')}`;
+  const listEl = document.getElementById('waiting-players');
+  listEl.innerHTML = state.players
+    .map((p, i) => `<li>${p.name}${i === 0 ? ' 👑' : ''}${p.id === socket.id ? ' (вы)' : ''}</li>`)
+    .join('');
+
+  if (state.players.length >= state.minPlayers) {
+    const spotsLeft = state.maxPlayers - state.players.length;
+    statusEl.textContent =
+      spotsLeft > 0
+        ? `Можно начинать, или подождите ещё до ${spotsLeft} игрок(ов) (максимум ${state.maxPlayers}).`
+        : 'Комната заполнена — можно начинать.';
     if (isHost) startBtn.classList.remove('hidden');
+    else startBtn.classList.add('hidden');
   } else {
-    statusEl.textContent = 'Ожидаем второго игрока…';
+    statusEl.textContent = `Нужно ещё минимум ${state.minPlayers - state.players.length} игрок(ов)…`;
     startBtn.classList.add('hidden');
   }
 }
@@ -76,9 +111,12 @@ socket.on('room-update', (state) => {
   if (!state.started) renderWaiting(state);
 });
 
-socket.on('player-left', () => {
-  alert('Второй игрок отключился. Комната закрыта.');
-  location.reload();
+socket.on('player-left-mid-game', (data) => {
+  isHost = data.hostId === socket.id;
+  assignColors(data.players);
+  renderScoreboard(data.players);
+  const note = document.getElementById('guess-status');
+  if (note) note.textContent = `${data.name} вышел(а) из игры. Продолжаем без него/неё.`;
 });
 
 // ---------- Поиск случайной точки (делает хост) ----------
@@ -134,10 +172,14 @@ socket.on('round-start', (data) => {
   latestRoundSpot = data;
   currentGuess = null;
   stopGuessCountdown();
+  if (data.hostId) isHost = data.hostId === socket.id;
+  if (data.players) {
+    assignColors(data.players);
+    renderScoreboard(data.players);
+  }
   document.getElementById('round-indicator').textContent = `Раунд ${data.round} / ${data.totalRounds}`;
   document.getElementById('guess-status').textContent = '';
   document.getElementById('submit-guess-btn').disabled = true;
-  if (data.players) renderScoreboard(data.players);
   if (data.deadline) startRoundCountdown(data.deadline);
   showScreen('game');
   loadPanorama(data.lat, data.lon);
@@ -185,11 +227,15 @@ function stopGuessCountdown() {
     clearInterval(guessCountdownInterval);
     guessCountdownInterval = null;
   }
+  document.getElementById('guess-panel').classList.remove('urgent');
+  document.getElementById('guess-status').classList.remove('urgent');
 }
 
 function startGuessCountdown(deadline, waitingFor) {
   stopGuessCountdown();
+  document.getElementById('guess-panel').classList.add('urgent');
   const statusEl = document.getElementById('guess-status');
+  statusEl.classList.add('urgent');
   const tick = () => {
     const secondsLeft = Math.max(0, Math.round((deadline - Date.now()) / 1000));
     statusEl.textContent = `Ждём: ${waitingFor.join(', ')} — осталось ${secondsLeft} сек`;
@@ -240,6 +286,14 @@ function setupGuessMap() {
         const coords = e.get('coords');
         placeGuessMarker(coords);
       });
+      // Панель реально меняет размер при наведении (не CSS-transform), поэтому
+      // карте нужно самой пересчитать проекцию под новый размер контейнера —
+      // иначе клик и точка на карте немного расходятся.
+      const panelEl = document.getElementById('guess-panel');
+      const resync = () => guessMap.container.fitToViewport();
+      panelEl.addEventListener('mouseenter', () => setTimeout(resync, 260));
+      panelEl.addEventListener('mouseleave', () => setTimeout(resync, 260));
+      panelEl.addEventListener('transitionend', resync);
     } else {
       guessMap.setCenter([55.7558, 37.6173], 9);
       if (guessPlacemark) {
@@ -263,7 +317,7 @@ document.getElementById('submit-guess-btn').addEventListener('click', () => {
   if (!currentGuess) return;
   socket.emit('submit-guess', currentGuess);
   document.getElementById('submit-guess-btn').disabled = true;
-  document.getElementById('guess-status').textContent = 'Догадка отправлена, ждём второго игрока…';
+  document.getElementById('guess-status').textContent = 'Догадка отправлена, ждём остальных…';
 });
 
 socket.on('guess-received', (data) => {
@@ -291,7 +345,8 @@ socket.on('round-result', (data) => {
       const row = document.createElement('div');
       row.className = 'result-row';
       const distText = r.distance != null ? `${Math.round(r.distance)} м` : 'не успел(а) угадать';
-      row.innerHTML = `<div><div class="name">${r.name}</div><div class="meta">${distText}</div></div><div>+${r.roundScore} (всего ${r.totalScore})</div>`;
+      const swatch = `<span class="color-dot" style="background:${colorFor(r.id).hex}"></span>`;
+      row.innerHTML = `<div><div class="name">${swatch}${r.name}</div><div class="meta">${distText}</div></div><div>+${r.roundScore} (всего ${r.totalScore})</div>`;
       listEl.appendChild(row);
     });
 
@@ -328,7 +383,7 @@ socket.on('round-result', (data) => {
       const pm = new ymaps.Placemark(
         [r.guess.lat, r.guess.lon],
         { hintContent: `${r.name}: ${Math.round(r.distance)} м` },
-        { preset: 'islands#blueDotIcon' }
+        { preset: colorFor(r.id).preset }
       );
       map.geoObjects.add(pm);
       const line = new ymaps.Polyline(
@@ -375,7 +430,6 @@ socket.on('game-over', (data) => {
     row.className = 'final-row' + (i === 0 ? ' winner' : '');
     row.innerHTML = `<span>${i === 0 ? '🏆 ' : ''}${p.name}</span><span>${p.score}</span>`;
     el.appendChild(row);
-  });
-});
+  });});
 
 document.getElementById('play-again-btn').addEventListener('click', () => location.reload());
