@@ -10,6 +10,8 @@ const io = new Server(server);
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
+const MAX_PLAYERS = 4;
+const MIN_PLAYERS = 2;
 const ROUNDS_PER_GAME = 5;
 const ROUND_TIMEOUT_MS = 180 * 1000; // общий таймер раунда — 3 минуты
 const FIND_SPOT_TIMEOUT_MS = 20 * 1000; // сколько ждём случайную точку от хоста, потом берём запасную из списка
@@ -135,6 +137,9 @@ function scoreForDistance(distanceMeters) {
 function publicRoomState(room) {
   return {
     players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score })),
+    hostId: room.players[0] ? room.players[0].id : null,
+    maxPlayers: MAX_PLAYERS,
+    minPlayers: MIN_PLAYERS,
     round: room.round,
     totalRounds: ROUNDS_PER_GAME,
     started: room.started,
@@ -176,6 +181,7 @@ function beginRound(code, spot) {
     lat: spot.lat,
     lon: spot.lon,
     players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score })),
+    hostId: room.players[0] ? room.players[0].id : null,
     deadline,
   });
   room.timer = setTimeout(() => finishRound(code), ROUND_TIMEOUT_MS);
@@ -231,6 +237,8 @@ io.on('connection', (socket) => {
       timer: null,
       started: false,
       gameOver: false,
+      awaitingNext: false,
+      pendingSpot: false,
     };
     rooms.set(code, room);
     socket.join(code);
@@ -241,8 +249,15 @@ io.on('connection', (socket) => {
   socket.on('join-room', ({ code, name }, cb) => {
     const room = rooms.get((code || '').toUpperCase());
     if (!room) return cb({ ok: false, error: 'Комната не найдена. Проверьте код.' });
-    if (room.players.length >= 2) return cb({ ok: false, error: 'В комнате уже двое игроков.' });
-    room.players.push({ id: socket.id, name: (name || 'Игрок 2').slice(0, 20), score: 0 });
+    if (room.started) return cb({ ok: false, error: 'Игра уже началась, подключиться нельзя.' });
+    if (room.players.length >= MAX_PLAYERS) {
+      return cb({ ok: false, error: `В комнате уже максимум игроков (${MAX_PLAYERS}).` });
+    }
+    room.players.push({
+      id: socket.id,
+      name: (name || `Игрок ${room.players.length + 1}`).slice(0, 20),
+      score: 0,
+    });
     socket.join(code.toUpperCase());
     socket.data.roomCode = code.toUpperCase();
     cb({ ok: true, code: code.toUpperCase(), state: publicRoomState(room) });
@@ -252,7 +267,8 @@ io.on('connection', (socket) => {
   socket.on('start-game', () => {
     const code = socket.data.roomCode;
     const room = rooms.get(code);
-    if (!room || room.players.length < 2 || room.started) return;
+    if (!room || room.players.length < MIN_PLAYERS || room.started) return;
+    if (room.players[0].id !== socket.id) return; // только хост запускает игру
     room.started = true;
     io.to(code).emit('room-update', publicRoomState(room));
     startRound(code);
@@ -307,9 +323,49 @@ io.on('connection', (socket) => {
     const code = socket.data.roomCode;
     const room = rooms.get(code);
     if (!room) return;
-    io.to(code).emit('player-left');
-    clearRoomTimer(room);
-    rooms.delete(code);
+
+    const leavingIdx = room.players.findIndex((p) => p.id === socket.id);
+    if (leavingIdx === -1) return;
+    const leavingName = room.players[leavingIdx].name;
+    const wasHost = leavingIdx === 0;
+    room.players.splice(leavingIdx, 1);
+    delete room.guesses[socket.id];
+
+    if (room.players.length === 0) {
+      clearRoomTimer(room);
+      rooms.delete(code);
+      return;
+    }
+
+    if (!room.started) {
+      // Лобби — просто обновляем список ожидающих.
+      io.to(code).emit('room-update', publicRoomState(room));
+      return;
+    }
+
+    // Игра уже идёт — остальные продолжают без вышедшего игрока.
+    io.to(code).emit('player-left-mid-game', {
+      name: leavingName,
+      players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score })),
+      hostId: room.players[0].id,
+    });
+
+    if (room.players.length < MIN_PLAYERS) {
+      // Играть больше не с кем — завершаем игру текущим счётом.
+      clearRoomTimer(room);
+      room.gameOver = true;
+      io.to(code).emit('game-over', { players: room.players.map((p) => ({ name: p.name, score: p.score })) });
+      return;
+    }
+
+    if (room.pendingSpot && wasHost) {
+      // Ушедший искал точку — просим нового хоста.
+      io.to(room.players[0].id).emit('find-spot', { round: room.round + 1 });
+    } else if (!room.awaitingNext && !room.pendingSpot) {
+      // Возможно, все оставшиеся уже отгадали — тогда пора завершить раунд.
+      const allGuessed = room.players.every((p) => room.guesses[p.id]);
+      if (allGuessed) finishRound(code);
+    }
   });
 });
 
