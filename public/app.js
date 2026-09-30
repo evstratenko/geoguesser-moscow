@@ -40,6 +40,7 @@ socket.on('connect', () => {
 const screens = {
   lobby: document.getElementById('screen-lobby'),
   waiting: document.getElementById('screen-waiting'),
+  loading: document.getElementById('screen-loading'),
   game: document.getElementById('screen-game'),
   result: document.getElementById('screen-result'),
   gameover: document.getElementById('screen-gameover'),
@@ -54,7 +55,8 @@ function showScreen(name) {
 
 document.getElementById('create-btn').addEventListener('click', () => {
   myName = document.getElementById('name-input').value.trim() || 'Игрок 1';
-  socket.emit('create-room', { name: myName }, (res) => {
+  const mode = document.querySelector('input[name="mode"]:checked').value;
+  socket.emit('create-room', { name: myName, mode }, (res) => {
     if (!res.ok) return showLobbyError('Не удалось создать комнату');
     myRoomCode = res.code;
     document.getElementById('room-code-display').textContent = myRoomCode;
@@ -85,6 +87,8 @@ function renderWaiting(state) {
   const statusEl = document.getElementById('waiting-status');
   const startBtn = document.getElementById('start-btn');
   const listEl = document.getElementById('waiting-players');
+  document.getElementById('waiting-mode').textContent =
+    state.mode === 'center' ? '🎯 Режим: только центр (в пределах ТТК)' : '🗺 Режим: вся Москва';
   listEl.innerHTML = state.players
     .map((p, i) => `<li>${p.name}${i === 0 ? ' 👑' : ''}${p.id === socket.id ? ' (вы)' : ''}</li>`)
     .join('');
@@ -103,7 +107,9 @@ function renderWaiting(state) {
   }
 }
 
-document.getElementById('start-btn').addEventListener('click', () => {
+document.getElementById('start-btn').addEventListener('click', (e) => {
+  e.target.disabled = true;
+  e.target.textContent = 'Запускаем…';
   socket.emit('start-game');
 });
 
@@ -124,12 +130,19 @@ socket.on('player-left-mid-game', (data) => {
 const MOSCOW_CENTER = [55.7522, 37.6156];
 const MAX_PANO_DISTANCE_M = 300; // панорама должна быть не дальше от случайной точки
 
-function randomMoscowPoint() {
-  // равномерно внутри эллипса примерно по границе МКАД
+// Радиусы эллипса (в градусах) для двух режимов поиска случайной точки.
+const AREA_RADIUS = {
+  all: { lat: 0.15, lon: 0.26 }, // примерно по границе МКАД
+  center: { lat: 0.05, lon: 0.09 }, // примерно по границе ТТК (~6 км от центра)
+};
+
+function randomMoscowPoint(mode) {
+  const r = AREA_RADIUS[mode === 'center' ? 'center' : 'all'];
+  // равномерно внутри эллипса
   for (;;) {
     const a = Math.random() * 2 - 1;
     const b = Math.random() * 2 - 1;
-    if (a * a + b * b <= 1) return [MOSCOW_CENTER[0] + a * 0.15, MOSCOW_CENTER[1] + b * 0.26];
+    if (a * a + b * b <= 1) return [MOSCOW_CENTER[0] + a * r.lat, MOSCOW_CENTER[1] + b * r.lon];
   }
 }
 
@@ -142,26 +155,42 @@ function distMeters(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-async function findRandomSpot(maxAttempts = 25) {
+async function findRandomSpot(mode, totalAttempts = 25, batchSize = 5, perAttemptTimeoutMs = 4000) {
   await new Promise((resolve) => ymaps.ready(resolve));
-  for (let i = 0; i < maxAttempts; i++) {
-    const pt = randomMoscowPoint();
+
+  async function tryOnePoint() {
+    const pt = randomMoscowPoint(mode);
+    const locatePromise = ymaps.panorama.locate(pt);
+    const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), perAttemptTimeoutMs));
     try {
-      const panoramas = await ymaps.panorama.locate(pt);
-      if (panoramas.length > 0) {
+      const panoramas = await Promise.race([locatePromise, timeoutPromise]);
+      if (panoramas && panoramas.length > 0) {
         const pos = panoramas[0].getPosition();
         if (distMeters(pt, pos) <= MAX_PANO_DISTANCE_M) return { lat: pos[0], lon: pos[1] };
       }
     } catch (err) {
       console.warn('locate failed, retrying', err);
     }
+    return null;
+  }
+
+  let attemptsLeft = totalAttempts;
+  while (attemptsLeft > 0) {
+    const n = Math.min(batchSize, attemptsLeft);
+    attemptsLeft -= n;
+    const batchResults = await Promise.all(Array.from({ length: n }, tryOnePoint));
+    const found = batchResults.find((r) => r);
+    if (found) return found;
   }
   return null;
 }
 
-socket.on('find-spot', async () => {
-  document.getElementById('next-round-note').textContent = 'Ищем случайную точку…';
-  const spot = await findRandomSpot();
+socket.on('searching-spot', () => {
+  showScreen('loading');
+});
+
+socket.on('find-spot', async (data) => {
+  const spot = await findRandomSpot(data && data.mode);
   if (spot) socket.emit('spot-found', spot);
   else socket.emit('spot-failed');
 });
@@ -352,15 +381,17 @@ socket.on('round-result', (data) => {
 
   const isLast = data.round >= data.totalRounds;
   const nextBtn = document.getElementById('next-round-btn');
-  if (isLast) {
-    document.getElementById('next-round-note').textContent = 'Это был последний раунд — сейчас покажем итог.';
-    nextBtn.classList.add('hidden');
-  } else if (isHost) {
-    document.getElementById('next-round-note').textContent = 'Когда оба посмотрели на карту — жмите «Следующий раунд».';
+  nextBtn.textContent = isLast ? 'Показать итог' : 'Следующий раунд';
+  if (isHost) {
+    document.getElementById('next-round-note').textContent = isLast
+      ? 'Это был последний раунд — рассмотрите карту и жмите «Показать итог».'
+      : 'Когда оба посмотрели на карту — жмите «Следующий раунд».';
     nextBtn.classList.remove('hidden');
     nextBtn.disabled = false;
   } else {
-    document.getElementById('next-round-note').textContent = 'Ждём, когда хост начнёт следующий раунд…';
+    document.getElementById('next-round-note').textContent = isLast
+      ? 'Это был последний раунд — ждём, когда хост покажет итог.'
+      : 'Ждём, когда хост начнёт следующий раунд…';
     nextBtn.classList.add('hidden');
   }
 
@@ -413,7 +444,7 @@ socket.on('round-result', (data) => {
 document.getElementById('next-round-btn').addEventListener('click', (e) => {
   socket.emit('next-round');
   e.target.disabled = true;
-  document.getElementById('next-round-note').textContent = 'Запускаем следующий раунд…';
+  document.getElementById('next-round-note').textContent = 'Продолжаем…';
 });
 
 // ---------- Game over ----------
