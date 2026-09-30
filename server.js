@@ -91,6 +91,14 @@ const MOSCOW_SPOTS = [
 const RECENTLY_USED_LIMIT = Math.max(MOSCOW_SPOTS.length - ROUNDS_PER_GAME * 2, ROUNDS_PER_GAME);
 let recentlyUsed = []; // FIFO очередь имён (name) недавно сыгранных точек
 
+// Режим "Центр" — точки только внутри примерно Третьего транспортного кольца
+// (ТТК не идеальный круг, поэтому это приближение — окружность ~6 км от Кремля).
+const MOSCOW_CENTER = { lat: 55.7522, lon: 37.6156 };
+const CENTER_RADIUS_M = 6000;
+const CENTER_SPOTS = MOSCOW_SPOTS.filter(
+  (s) => haversineMeters(MOSCOW_CENTER.lat, MOSCOW_CENTER.lon, s.lat, s.lon) <= CENTER_RADIUS_M
+);
+
 /** rooms: code -> { players: [{id,name,score}], round, order, used, guesses, timer, started, gameOver } */
 const rooms = new Map();
 
@@ -103,12 +111,13 @@ function makeRoomCode() {
   return code;
 }
 
-function pickRoundOrder() {
+function pickRoundOrder(mode) {
+  const baseList = mode === 'center' ? CENTER_SPOTS : MOSCOW_SPOTS;
   const usedSet = new Set(recentlyUsed);
-  const fresh = MOSCOW_SPOTS.filter((s) => !usedSet.has(s.name));
+  const fresh = baseList.filter((s) => !usedSet.has(s.name));
   // Если "свежих" точек не хватает на игру — добираем из полного списка,
   // чтобы игра не зависела от истории (пул всё равно достаточно большой).
-  const pool = fresh.length >= ROUNDS_PER_GAME ? fresh : MOSCOW_SPOTS;
+  const pool = fresh.length >= ROUNDS_PER_GAME ? fresh : baseList;
   const shuffled = [...pool].sort(() => Math.random() - 0.5);
   const chosen = shuffled.slice(0, ROUNDS_PER_GAME);
 
@@ -138,6 +147,7 @@ function publicRoomState(room) {
   return {
     players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score })),
     hostId: room.players[0] ? room.players[0].id : null,
+    mode: room.mode,
     maxPlayers: MAX_PLAYERS,
     minPlayers: MIN_PLAYERS,
     round: room.round,
@@ -161,8 +171,10 @@ function startRound(code) {
   room.guesses = {};
   room.currentSpot = null;
   room.pendingSpot = true;
+  // Показываем экран загрузки всем сразу, чтобы не выглядело как зависание.
+  io.to(code).emit('searching-spot', { round: room.round + 1 });
   // Хост ищет в своём браузере случайную точку, где точно есть панорама.
-  io.to(room.players[0].id).emit('find-spot', { round: room.round + 1 });
+  io.to(room.players[0].id).emit('find-spot', { round: room.round + 1, mode: room.mode });
   room.timer = setTimeout(() => {
     if (room.pendingSpot) beginRound(code, room.order[room.round]); // запасная точка из списка
   }, FIND_SPOT_TIMEOUT_MS);
@@ -215,24 +227,18 @@ function finishRound(code) {
   });
 
   room.round += 1;
-
-  if (room.round >= ROUNDS_PER_GAME) {
-    room.gameOver = true;
-    setTimeout(() => {
-      io.to(code).emit('game-over', { players: room.players.map((p) => ({ name: p.name, score: p.score })) });
-    }, 300);
-  } else {
-    room.awaitingNext = true; // ждём, когда хост нажмёт "следующий раунд"
-  }
+  room.awaitingNext = true; // ждём хоста — продолжить игру или (после 5-го раунда) показать итог
 }
 
 io.on('connection', (socket) => {
-  socket.on('create-room', ({ name }, cb) => {
+  socket.on('create-room', ({ name, mode }, cb) => {
     const code = makeRoomCode();
+    const roomMode = mode === 'center' ? 'center' : 'all';
     const room = {
       players: [{ id: socket.id, name: (name || 'Игрок 1').slice(0, 20), score: 0 }],
       round: 0,
-      order: pickRoundOrder(),
+      mode: roomMode,
+      order: pickRoundOrder(roomMode),
       guesses: {},
       timer: null,
       started: false,
@@ -278,9 +284,13 @@ io.on('connection', (socket) => {
     const code = socket.data.roomCode;
     const room = rooms.get(code);
     if (!room || !room.pendingSpot || room.players[0].id !== socket.id) return;
-    const ok =
+    const inMoscow =
       typeof lat === 'number' && typeof lon === 'number' &&
       lat > 55.4 && lat < 56.0 && lon > 37.2 && lon < 38.0;
+    const inCenter =
+      room.mode !== 'center' ||
+      (inMoscow && haversineMeters(MOSCOW_CENTER.lat, MOSCOW_CENTER.lon, lat, lon) <= CENTER_RADIUS_M + 500);
+    const ok = inMoscow && inCenter;
     beginRound(code, ok ? { lat, lon, name: 'Случайная точка' } : room.order[room.round]);
   });
 
@@ -316,7 +326,12 @@ io.on('connection', (socket) => {
     if (!room || !room.awaitingNext || room.gameOver) return;
     if (room.players[0].id !== socket.id) return; // только хост может продолжить
     room.awaitingNext = false;
-    startRound(code);
+    if (room.round >= ROUNDS_PER_GAME) {
+      room.gameOver = true;
+      io.to(code).emit('game-over', { players: room.players.map((p) => ({ name: p.name, score: p.score })) });
+    } else {
+      startRound(code);
+    }
   });
 
   socket.on('disconnect', () => {
