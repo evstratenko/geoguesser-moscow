@@ -54,8 +54,7 @@ function showScreen(name) {
 
 document.getElementById('create-btn').addEventListener('click', () => {
   myName = document.getElementById('name-input').value.trim() || 'Игрок 1';
-  const mode = document.querySelector('input[name="mode"]:checked').value;
-  socket.emit('create-room', { name: myName, mode }, (res) => {
+  socket.emit('create-room', { name: myName }, (res) => {
     if (!res.ok) return showLobbyError('Не удалось создать комнату');
     myRoomCode = res.code;
     document.getElementById('room-code-display').textContent = myRoomCode;
@@ -86,8 +85,6 @@ function renderWaiting(state) {
   const statusEl = document.getElementById('waiting-status');
   const startBtn = document.getElementById('start-btn');
   const listEl = document.getElementById('waiting-players');
-  document.getElementById('waiting-mode').textContent =
-    state.mode === 'center' ? '🎯 Режим: только центр (в пределах ТТК)' : '🗺 Режим: вся Москва';
   listEl.innerHTML = state.players
     .map((p, i) => `<li>${p.name}${i === 0 ? ' 👑' : ''}${p.id === socket.id ? ' (вы)' : ''}</li>`)
     .join('');
@@ -106,9 +103,7 @@ function renderWaiting(state) {
   }
 }
 
-document.getElementById('start-btn').addEventListener('click', (e) => {
-  e.target.disabled = true;
-  e.target.textContent = 'Запускаем…';
+document.getElementById('start-btn').addEventListener('click', () => {
   socket.emit('start-game');
 });
 
@@ -122,6 +117,53 @@ socket.on('player-left-mid-game', (data) => {
   renderScoreboard(data.players);
   const note = document.getElementById('guess-status');
   if (note) note.textContent = `${data.name} вышел(а) из игры. Продолжаем без него/неё.`;
+});
+
+// ---------- Поиск случайной точки (делает хост) ----------
+
+const MOSCOW_CENTER = [55.7522, 37.6156];
+const MAX_PANO_DISTANCE_M = 300; // панорама должна быть не дальше от случайной точки
+
+function randomMoscowPoint() {
+  // равномерно внутри эллипса примерно по границе МКАД
+  for (;;) {
+    const a = Math.random() * 2 - 1;
+    const b = Math.random() * 2 - 1;
+    if (a * a + b * b <= 1) return [MOSCOW_CENTER[0] + a * 0.15, MOSCOW_CENTER[1] + b * 0.26];
+  }
+}
+
+function distMeters(a, b) {
+  const R = 6371000;
+  const rad = (d) => (d * Math.PI) / 180;
+  const dLat = rad(b[0] - a[0]);
+  const dLon = rad(b[1] - a[1]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a[0])) * Math.cos(rad(b[0])) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+async function findRandomSpot(maxAttempts = 25) {
+  await new Promise((resolve) => ymaps.ready(resolve));
+  for (let i = 0; i < maxAttempts; i++) {
+    const pt = randomMoscowPoint();
+    try {
+      const panoramas = await ymaps.panorama.locate(pt);
+      if (panoramas.length > 0) {
+        const pos = panoramas[0].getPosition();
+        if (distMeters(pt, pos) <= MAX_PANO_DISTANCE_M) return { lat: pos[0], lon: pos[1] };
+      }
+    } catch (err) {
+      console.warn('locate failed, retrying', err);
+    }
+  }
+  return null;
+}
+
+socket.on('find-spot', async () => {
+  document.getElementById('next-round-note').textContent = 'Ищем случайную точку…';
+  const spot = await findRandomSpot();
+  if (spot) socket.emit('spot-found', spot);
+  else socket.emit('spot-failed');
 });
 
 // ---------- Game ----------
@@ -310,17 +352,15 @@ socket.on('round-result', (data) => {
 
   const isLast = data.round >= data.totalRounds;
   const nextBtn = document.getElementById('next-round-btn');
-  nextBtn.textContent = isLast ? 'Показать итог' : 'Следующий раунд';
-  if (isHost) {
-    document.getElementById('next-round-note').textContent = isLast
-      ? 'Это был последний раунд — рассмотрите карту и жмите «Показать итог».'
-      : 'Когда оба посмотрели на карту — жмите «Следующий раунд».';
+  if (isLast) {
+    document.getElementById('next-round-note').textContent = 'Это был последний раунд — сейчас покажем итог.';
+    nextBtn.classList.add('hidden');
+  } else if (isHost) {
+    document.getElementById('next-round-note').textContent = 'Когда оба посмотрели на карту — жмите «Следующий раунд».';
     nextBtn.classList.remove('hidden');
     nextBtn.disabled = false;
   } else {
-    document.getElementById('next-round-note').textContent = isLast
-      ? 'Это был последний раунд — ждём, когда хост покажет итог.'
-      : 'Ждём, когда хост начнёт следующий раунд…';
+    document.getElementById('next-round-note').textContent = 'Ждём, когда хост начнёт следующий раунд…';
     nextBtn.classList.add('hidden');
   }
 
@@ -354,13 +394,26 @@ socket.on('round-result', (data) => {
       map.geoObjects.add(line);
     });
     map.setBounds(map.geoObjects.getBounds(), { checkZoomRange: true, zoomMargin: 40 });
+
+    if (data.actual.name === 'Случайная точка') {
+      ymaps
+        .geocode([data.actual.lat, data.actual.lon], { results: 1 })
+        .then((res) => {
+          const first = res.geoObjects.get(0);
+          if (first) {
+            document.getElementById('result-title').textContent =
+              `Раунд ${data.round} / ${data.totalRounds} — ${first.getAddressLine()}`;
+          }
+        })
+        .catch(() => {});
+    }
   });
 });
 
 document.getElementById('next-round-btn').addEventListener('click', (e) => {
   socket.emit('next-round');
   e.target.disabled = true;
-  document.getElementById('next-round-note').textContent = 'Продолжаем…';
+  document.getElementById('next-round-note').textContent = 'Запускаем следующий раунд…';
 });
 
 // ---------- Game over ----------
