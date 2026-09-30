@@ -5,7 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Геогессер по Москве</title>
 <link rel="stylesheet" href="style.css" />
-<script src="https://api-maps.yandex.ru/2.1/?apikey=dca8003f-2829-471f-8480-c63a2c9eca90&lang=ru_RU"></script>
+<!-- Два ключа Яндекс.Карт — при каждой загрузке страницы выбирается случайный,
+     чтобы делить лимит запросов между ними. Чтобы добавить ещё ключ, просто
+     впиши его новой строкой в массив ниже. -->
+<script>
+  var YANDEX_API_KEYS = [
+    'dca8003f-2829-471f-8480-c63a2c9eca90'
+  ];
+  var chosenKey = YANDEX_API_KEYS[Math.floor(Math.random() * YANDEX_API_KEYS.length)];
+  document.write(
+    '<script src="https://api-maps.yandex.ru/2.1/?apikey=' + chosenKey + '&lang=ru_RU"><\/script>'
+  );
+</script>
 <script src="/socket.io/socket.io.js"></script>
 </head>
 <body>
@@ -17,18 +28,6 @@
 
     <label>Ваше имя</label>
     <input id="name-input" type="text" placeholder="Введите имя" maxlength="20" />
-
-    <label>Режим (задаёт тот, кто создаёт комнату)</label>
-    <div class="mode-select">
-      <label class="mode-option">
-        <input type="radio" name="mode" value="all" checked />
-        Вся Москва
-      </label>
-      <label class="mode-option">
-        <input type="radio" name="mode" value="center" />
-        Только центр (в пределах ТТК)
-      </label>
-    </div>
 
     <div class="lobby-actions">
       <button id="create-btn" class="primary">Создать комнату</button>
@@ -47,7 +46,6 @@
     <p>Код комнаты:</p>
     <div id="room-code-display" class="room-code"></div>
     <p>Отправьте этот код друзьям — до 4 игроков в комнате.</p>
-    <p id="waiting-mode" class="mode-badge"></p>
     <ul id="waiting-players" class="waiting-players"></ul>
     <p id="waiting-status">Ожидаем игроков…</p>
     <button id="start-btn" class="primary hidden">Начать игру</button>
