@@ -40,7 +40,6 @@ socket.on('connect', () => {
 const screens = {
   lobby: document.getElementById('screen-lobby'),
   waiting: document.getElementById('screen-waiting'),
-  loading: document.getElementById('screen-loading'),
   game: document.getElementById('screen-game'),
   result: document.getElementById('screen-result'),
   gameover: document.getElementById('screen-gameover'),
@@ -123,76 +122,6 @@ socket.on('player-left-mid-game', (data) => {
   renderScoreboard(data.players);
   const note = document.getElementById('guess-status');
   if (note) note.textContent = `${data.name} вышел(а) из игры. Продолжаем без него/неё.`;
-});
-
-// ---------- Поиск случайной точки (делает хост) ----------
-
-const MOSCOW_CENTER = [55.7522, 37.6156];
-const MAX_PANO_DISTANCE_M = 300; // панорама должна быть не дальше от случайной точки
-
-// Радиусы эллипса (в градусах) для двух режимов поиска случайной точки.
-const AREA_RADIUS = {
-  all: { lat: 0.15, lon: 0.26 }, // примерно по границе МКАД
-  center: { lat: 0.05, lon: 0.09 }, // примерно по границе ТТК (~6 км от центра)
-};
-
-function randomMoscowPoint(mode) {
-  const r = AREA_RADIUS[mode === 'center' ? 'center' : 'all'];
-  // равномерно внутри эллипса
-  for (;;) {
-    const a = Math.random() * 2 - 1;
-    const b = Math.random() * 2 - 1;
-    if (a * a + b * b <= 1) return [MOSCOW_CENTER[0] + a * r.lat, MOSCOW_CENTER[1] + b * r.lon];
-  }
-}
-
-function distMeters(a, b) {
-  const R = 6371000;
-  const rad = (d) => (d * Math.PI) / 180;
-  const dLat = rad(b[0] - a[0]);
-  const dLon = rad(b[1] - a[1]);
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a[0])) * Math.cos(rad(b[0])) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
-
-async function findRandomSpot(mode, totalAttempts = 25, batchSize = 5, perAttemptTimeoutMs = 4000) {
-  await new Promise((resolve) => ymaps.ready(resolve));
-
-  async function tryOnePoint() {
-    const pt = randomMoscowPoint(mode);
-    const locatePromise = ymaps.panorama.locate(pt);
-    const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), perAttemptTimeoutMs));
-    try {
-      const panoramas = await Promise.race([locatePromise, timeoutPromise]);
-      if (panoramas && panoramas.length > 0) {
-        const pos = panoramas[0].getPosition();
-        if (distMeters(pt, pos) <= MAX_PANO_DISTANCE_M) return { lat: pos[0], lon: pos[1] };
-      }
-    } catch (err) {
-      console.warn('locate failed, retrying', err);
-    }
-    return null;
-  }
-
-  let attemptsLeft = totalAttempts;
-  while (attemptsLeft > 0) {
-    const n = Math.min(batchSize, attemptsLeft);
-    attemptsLeft -= n;
-    const batchResults = await Promise.all(Array.from({ length: n }, tryOnePoint));
-    const found = batchResults.find((r) => r);
-    if (found) return found;
-  }
-  return null;
-}
-
-socket.on('searching-spot', () => {
-  showScreen('loading');
-});
-
-socket.on('find-spot', async (data) => {
-  const spot = await findRandomSpot(data && data.mode);
-  if (spot) socket.emit('spot-found', spot);
-  else socket.emit('spot-failed');
 });
 
 // ---------- Game ----------
@@ -425,19 +354,6 @@ socket.on('round-result', (data) => {
       map.geoObjects.add(line);
     });
     map.setBounds(map.geoObjects.getBounds(), { checkZoomRange: true, zoomMargin: 40 });
-
-    if (data.actual.name === 'Случайная точка') {
-      ymaps
-        .geocode([data.actual.lat, data.actual.lon], { results: 1 })
-        .then((res) => {
-          const first = res.geoObjects.get(0);
-          if (first) {
-            document.getElementById('result-title').textContent =
-              `Раунд ${data.round} / ${data.totalRounds} — ${first.getAddressLine()}`;
-          }
-        })
-        .catch(() => {});
-    }
   });
 });
 
