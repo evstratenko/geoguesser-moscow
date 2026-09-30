@@ -14,7 +14,6 @@ const MAX_PLAYERS = 4;
 const MIN_PLAYERS = 2;
 const ROUNDS_PER_GAME = 5;
 const ROUND_TIMEOUT_MS = 180 * 1000; // общий таймер раунда — 3 минуты
-const FIND_SPOT_TIMEOUT_MS = 20 * 1000; // сколько ждём случайную точку от хоста, потом берём запасную из списка
 const AFTER_FIRST_GUESS_TIMEOUT_MS = 20 * 1000; // сколько ждём второго игрока после первой догадки
 const SCORE_DECAY_METERS = 4000; // насколько быстро падают очки с расстоянием
 
@@ -169,22 +168,16 @@ function startRound(code) {
   if (!room) return;
   clearRoomTimer(room);
   room.guesses = {};
-  room.currentSpot = null;
-  room.pendingSpot = true;
-  // Показываем экран загрузки всем сразу, чтобы не выглядело как зависание.
-  io.to(code).emit('searching-spot', { round: room.round + 1 });
-  // Хост ищет в своём браузере случайную точку, где точно есть панорама.
-  io.to(room.players[0].id).emit('find-spot', { round: room.round + 1, mode: room.mode });
-  room.timer = setTimeout(() => {
-    if (room.pendingSpot) beginRound(code, room.order[room.round]); // запасная точка из списка
-  }, FIND_SPOT_TIMEOUT_MS);
+  // Точка берётся сразу из проверенного списка — без поиска на клиенте.
+  // Так на раунд уходит всего один запрос к API панорам (на рендер), а не
+  // десятки при поиске случайной точки, что раньше упиралось в лимит Яндекса.
+  beginRound(code, room.order[room.round]);
 }
 
 function beginRound(code, spot) {
   const room = rooms.get(code);
   if (!room) return;
   clearRoomTimer(room);
-  room.pendingSpot = false;
   room.currentSpot = spot;
   const deadline = Date.now() + ROUND_TIMEOUT_MS;
   io.to(code).emit('round-start', {
@@ -244,7 +237,6 @@ io.on('connection', (socket) => {
       started: false,
       gameOver: false,
       awaitingNext: false,
-      pendingSpot: false,
     };
     rooms.set(code, room);
     socket.join(code);
@@ -278,27 +270,6 @@ io.on('connection', (socket) => {
     room.started = true;
     io.to(code).emit('room-update', publicRoomState(room));
     startRound(code);
-  });
-
-  socket.on('spot-found', ({ lat, lon }) => {
-    const code = socket.data.roomCode;
-    const room = rooms.get(code);
-    if (!room || !room.pendingSpot || room.players[0].id !== socket.id) return;
-    const inMoscow =
-      typeof lat === 'number' && typeof lon === 'number' &&
-      lat > 55.4 && lat < 56.0 && lon > 37.2 && lon < 38.0;
-    const inCenter =
-      room.mode !== 'center' ||
-      (inMoscow && haversineMeters(MOSCOW_CENTER.lat, MOSCOW_CENTER.lon, lat, lon) <= CENTER_RADIUS_M + 500);
-    const ok = inMoscow && inCenter;
-    beginRound(code, ok ? { lat, lon, name: 'Случайная точка' } : room.order[room.round]);
-  });
-
-  socket.on('spot-failed', () => {
-    const code = socket.data.roomCode;
-    const room = rooms.get(code);
-    if (!room || !room.pendingSpot || room.players[0].id !== socket.id) return;
-    beginRound(code, room.order[room.round]);
   });
 
   socket.on('submit-guess', ({ lat, lon }) => {
@@ -342,7 +313,6 @@ io.on('connection', (socket) => {
     const leavingIdx = room.players.findIndex((p) => p.id === socket.id);
     if (leavingIdx === -1) return;
     const leavingName = room.players[leavingIdx].name;
-    const wasHost = leavingIdx === 0;
     room.players.splice(leavingIdx, 1);
     delete room.guesses[socket.id];
 
@@ -373,10 +343,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (room.pendingSpot && wasHost) {
-      // Ушедший искал точку — просим нового хоста.
-      io.to(room.players[0].id).emit('find-spot', { round: room.round + 1 });
-    } else if (!room.awaitingNext && !room.pendingSpot) {
+    if (!room.awaitingNext) {
       // Возможно, все оставшиеся уже отгадали — тогда пора завершить раунд.
       const allGuessed = room.players.every((p) => room.guesses[p.id]);
       if (allGuessed) finishRound(code);
